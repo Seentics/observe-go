@@ -31,7 +31,7 @@ type MiddlewareOptions struct {
 
 // Middleware gives every request a server span, continuing the caller's
 // trace when a traceparent header arrives, and records it in the
-// http.server.request.duration histogram (milliseconds, by http.route,
+// http.server.request.duration histogram (seconds, by http.route,
 // http.request.method and http.status_class). The span is on the request's
 // context, so Log.WithContext(r.Context()) links log lines to it.
 //
@@ -119,13 +119,18 @@ func recordDuration(r *http.Request, started time.Time, status int) {
 	// Created on first use, not at import: the meter provider is only real
 	// once Configure has run.
 	durationOnce.Do(func() {
-		durationHist, _ = Meter().Float64Histogram("http.server.request.duration", metric.WithUnit("ms"),
+		// Seconds, with OpenTelemetry's HTTP duration buckets: the unit its semantic conventions
+		// fix for this metric, and the one the Node SDK's instrumentation records. In
+		// milliseconds, as it was, a project with Go and Node services stored one metric in two
+		// units and every chart of it read one of them 1000x off.
+		durationHist, _ = Meter().Float64Histogram("http.server.request.duration", metric.WithUnit("s"),
+			metric.WithExplicitBucketBoundaries(0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10),
 			metric.WithDescription("Time to answer each request, by route, method and status class"))
 	})
 	if durationHist == nil {
 		return
 	}
-	durationHist.Record(r.Context(), float64(time.Since(started).Microseconds())/1000, metric.WithAttributes(
+	durationHist.Record(r.Context(), time.Since(started).Seconds(), metric.WithAttributes(
 		attribute.String("http.route", routeOf(r)),
 		attribute.String("http.request.method", r.Method),
 		attribute.String("http.status_class", statusClass(status)),

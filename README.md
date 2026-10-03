@@ -66,7 +66,7 @@ Values under secret-looking names — `password`, `token`, `authorization`, `coo
 
 ### HTTP
 
-`observe.Middleware(handler)` starts a server span per request, continuing the caller's trace when a `traceparent` arrives, and records `http.server.request.duration` (ms, by `http.route`, `http.request.method`, `http.status_class`). Routes come from `http.ServeMux` patterns, so `/orders/81423` is recorded as `/orders/{id}`.
+`observe.Middleware(handler)` starts a server span per request, continuing the caller's trace when a `traceparent` arrives, and records `http.server.request.duration` (seconds, as OpenTelemetry specifies and the Node SDK records, by `http.route`, `http.request.method`, `http.status_class`). Routes come from `http.ServeMux` patterns, so `/orders/81423` is recorded as `/orders/{id}`.
 
 ```go
 observe.Middleware(mux, observe.MiddlewareOptions{

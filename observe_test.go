@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -371,4 +373,40 @@ type readFromRecorder struct {
 func (r *readFromRecorder) ReadFrom(src io.Reader) (int64, error) {
 	*r.used = true
 	return io.Copy(r.ResponseRecorder, src)
+}
+
+// http.server.request.duration is in seconds, as OpenTelemetry specifies and the Node SDK
+// records: one metric in two units read 1000x off on every chart of it.
+func TestRequestDurationIsInSeconds(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	previous := otel.GetMeterProvider()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	durationOnce, durationHist = sync.Once{}, nil
+	t.Cleanup(func() { otel.SetMeterProvider(previous); durationOnce, durationHist = sync.Once{}, nil })
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /slow", func(w http.ResponseWriter, r *http.Request) { time.Sleep(30 * time.Millisecond) })
+	Middleware(mux, MiddlewareOptions{MeasureOnly: func(*http.Request) bool { return true }}).
+		ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/slow", nil))
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "http.server.request.duration" {
+				continue
+			}
+			if m.Unit != "s" {
+				t.Fatalf("unit %q, want s", m.Unit)
+			}
+			sum := m.Data.(metricdata.Histogram[float64]).DataPoints[0].Sum
+			if sum < 0.025 || sum > 1 {
+				t.Fatalf("recorded %v for a ~30ms request, want about 0.03 (seconds)", sum)
+			}
+			return
+		}
+	}
+	t.Fatal("http.server.request.duration not recorded")
 }
