@@ -88,8 +88,8 @@ type Options struct {
 	// Default true.
 	RuntimeMetrics *bool
 
-	// HostMetrics reports process and host CPU, memory, disk and network
-	// (host figures on Linux only), plus host.* and os.type resource
+	// HostMetrics reports process CPU and memory, and the server's CPU, load,
+	// memory and root disk (Linux only), plus host.* and os.type resource
 	// attributes. Default true. Env: SEENTICS_HOST_METRICS (also
 	// OBSERVE_HOST_METRICS). Turn it off if the OpenTelemetry Collector's
 	// hostmetrics receiver already covers the host — both would send it.

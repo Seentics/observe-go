@@ -110,11 +110,9 @@ Also on by default, read once per export interval, standard library only:
 | `system.cpu.load_average.1m` | `{thread}` | |
 | `system.memory.usage` | `By` | `state`: used, free, cached |
 | `system.memory.utilization` | `1` | `state`: used, free |
-| `system.filesystem.usage` / `.utilization` | `By` / `1` | `mountpoint`, `device`, `state`: used, free (real disks only, at most 8) |
-| `system.network.io` | `By` | `device`, `direction`: receive, transmit (not `lo` or container bridges) |
-| `system.disk.io` | `By` | `device`, `direction`: read, write (whole disks only) |
+| `system.filesystem.usage` / `.utilization` | `By` / `1` | `mountpoint`: `/`, `state`: used, free |
 
-The `system.*` metrics are read from `/proc` and `statfs`, so they are reported on Linux only; other platforms send the `process.*` ones. The resource also gets `host.name`, `host.arch`, `os.type`, `process.pid` and `service.instance.id` (values from `OTEL_RESOURCE_ATTRIBUTES` win).
+The `system.*` metrics are read from `/proc` and `statfs`, so they are reported on Linux only; other platforms send the `process.*` ones. They read the same from inside a container as on the server itself — `/proc/stat`, `/proc/loadavg` and `/proc/meminfo` are not per-container, and the root filesystem's space is the server's disk. Network and disk I/O are not reported: from a container they would be the container's, not the server's. In a container, name the server with `hostname:` (compose) or `OTEL_RESOURCE_ATTRIBUTES=host.name=<server>`. The resource also gets `host.name`, `host.arch`, `os.type`, `process.pid` and `service.instance.id` (values from `OTEL_RESOURCE_ATTRIBUTES` win).
 
 Turn it off with `Options.HostMetrics` or `SEENTICS_HOST_METRICS=false` (`OBSERVE_HOST_METRICS` works too). Do not run it on a host where the OpenTelemetry Collector's `hostmetrics` receiver is also enabled: the series would be sent twice.
 
@@ -161,7 +159,7 @@ With the key in the environment, traces and metrics start at import, so `Configu
 | `TracesSampleRate` | `1` | share of new traces kept; continued traces keep the caller's decision |
 | `MetricExportInterval` | `60s` | |
 | `RuntimeMetrics` | `true` | Go runtime memory, goroutines, GC |
-| `HostMetrics` | `true` | process and host CPU, memory, disk, network; host figures on Linux only |
+| `HostMetrics` | `true` | process CPU and memory; the server's CPU, load, memory and root disk (Linux) |
 | `OnError` | writes to stderr | the only place SDK failures surface |
 
 ## A missing key never breaks your app

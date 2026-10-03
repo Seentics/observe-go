@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -15,21 +14,19 @@ import (
 	"go.opentelemetry.io/otel/metric"
 )
 
-// Process and host metrics, read once per export interval so the Metrics
-// page has CPU, memory, disk and network with no user code. The host side
-// parses /proc and calls statfs, so it reports on Linux only; elsewhere those
-// instruments are simply never registered. Everything here is standard
+// Process metrics, and the server's CPU, memory and root disk, read once per
+// export interval with no user code. Only what reads true from inside a
+// container as well as outside one: /proc/stat, /proc/loadavg and
+// /proc/meminfo are not namespaced, and the root filesystem's space is the
+// server's disk. Network counters are namespaced (a container sees only its
+// own traffic) and other disks are only partly visible, so neither is
+// reported. The host side parses /proc and calls statfs, so it reports on
+// Linux only; elsewhere those instruments are simply never registered. Everything here is standard
 // library — no gopsutil — and nothing returns an error from a callback: a
 // file that cannot be read just means no data points that interval.
 //
 // Do not run this alongside the OpenTelemetry Collector's hostmetrics
 // receiver on the same host: the series would be sent twice.
-
-const (
-	maxFilesystems = 8  // bounds the mountpoint/device attribute cardinality
-	maxNetDevices  = 16 // likewise for network interfaces
-	maxDiskDevices = 16 // and block devices
-)
 
 var startedAt = time.Now()
 
@@ -137,156 +134,7 @@ func parseMemInfo(s string) (memInfo, bool) {
 	return m, haveTotal && haveAvail && m.total > 0 && m.available <= m.total
 }
 
-type mount struct{ device, mountpoint, fstype string }
-
-// Filesystems that are not storage anyone monitors.
-var pseudoFS = map[string]bool{
-	"proc": true, "sysfs": true, "tmpfs": true, "devtmpfs": true, "devpts": true,
-	"overlay": true, "squashfs": true, "autofs": true, "mqueue": true, "hugetlbfs": true,
-	"debugfs": true, "tracefs": true, "securityfs": true, "pstore": true, "bpf": true,
-	"configfs": true, "fusectl": true, "binfmt_misc": true, "ramfs": true, "nsfs": true,
-	"rpc_pipefs": true, "efivarfs": true, "fuse.lxcfs": true, "selinuxfs": true,
-}
-
-var skipMountPrefixes = []string{"/proc", "/sys", "/dev", "/run", "/snap", "/var/lib/docker", "/var/lib/containers", "/var/lib/kubelet"}
-
-// Single-file bind mounts a container runtime adds on top of the real disk:
-// /etc/hosts and friends, and `docker run --init`'s /sbin/docker-init.
-var skipMountFiles = map[string]bool{"/etc/hosts": true, "/etc/hostname": true, "/etc/resolv.conf": true, "/sbin/docker-init": true}
-
-// parseMounts reads /proc/mounts: "/" always, first, whatever its filesystem —
-// in a container it is an overlay, and the space it reports is the disk the
-// container writes to — then real block-device filesystems, one entry per
-// device (bind mounts repeat it; the shortest mountpoint wins), in file order,
-// at most maxFilesystems. Skipping "/" as an overlay left a container with no
-// root disk, and its only "disk" a file bind mount like /sbin/docker-init.
-func parseMounts(s string) []mount {
-	out := []mount{{mountpoint: "/"}}
-	index := map[string]int{}
-	for _, line := range strings.Split(s, "\n") {
-		f := strings.Fields(line)
-		if len(f) < 3 {
-			continue
-		}
-		m := mount{device: unescapeMount(f[0]), mountpoint: unescapeMount(f[1]), fstype: f[2]}
-		if m.mountpoint == "/" {
-			if strings.HasPrefix(m.device, "/") {
-				out[0] = m
-				index[m.device] = 0
-			} else {
-				out[0].fstype = m.fstype
-			}
-			continue
-		}
-		if pseudoFS[m.fstype] || strings.HasPrefix(m.fstype, "cgroup") || !strings.HasPrefix(m.device, "/") ||
-			strings.HasPrefix(m.device, "/dev/loop") || skipMountFiles[m.mountpoint] {
-			continue
-		}
-		skip := false
-		for _, p := range skipMountPrefixes {
-			if m.mountpoint == p || strings.HasPrefix(m.mountpoint, p+"/") {
-				skip = true
-				break
-			}
-		}
-		if skip {
-			continue
-		}
-		if i, seen := index[m.device]; seen {
-			if len(m.mountpoint) < len(out[i].mountpoint) {
-				out[i] = m
-			}
-			continue
-		}
-		if len(out) >= maxFilesystems {
-			continue
-		}
-		index[m.device] = len(out)
-		out = append(out, m)
-	}
-	return out
-}
-
-// unescapeMount decodes the octal escapes /proc/mounts uses for spaces.
-func unescapeMount(s string) string {
-	if !strings.Contains(s, `\`) {
-		return s
-	}
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' && i+3 < len(s) {
-			if n, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
-				b.WriteByte(byte(n))
-				i += 3
-				continue
-			}
-		}
-		b.WriteByte(s[i])
-	}
-	return b.String()
-}
-
 type fsUsage struct{ used, free, total uint64 }
-
-type ioCounters struct {
-	device string
-	a, b   uint64 // receive/transmit, or read/write, in bytes
-}
-
-// Container and virtual interfaces would multiply series for no insight.
-var skipNetPrefixes = []string{"lo", "veth", "docker", "br-", "cni", "flannel", "cali", "virbr"}
-
-// parseNetDev reads /proc/net/dev: receive bytes is the first counter after
-// the interface name, transmit bytes the ninth.
-func parseNetDev(s string) []ioCounters {
-	var out []ioCounters
-	for _, line := range strings.Split(s, "\n") {
-		name, rest, ok := strings.Cut(line, ":")
-		if !ok {
-			continue
-		}
-		name = strings.TrimSpace(name)
-		skip := name == ""
-		for _, p := range skipNetPrefixes {
-			if strings.HasPrefix(name, p) {
-				skip = true
-			}
-		}
-		f := strings.Fields(rest)
-		if skip || len(f) < 9 || len(out) >= maxNetDevices {
-			continue
-		}
-		rx, err1 := strconv.ParseUint(f[0], 10, 64)
-		tx, err2 := strconv.ParseUint(f[8], 10, 64)
-		if err1 != nil || err2 != nil {
-			continue
-		}
-		out = append(out, ioCounters{name, rx, tx})
-	}
-	return out
-}
-
-// Whole disks only: partitions (sda1, nvme0n1p1) would double count, and
-// loop, ram and device-mapper devices are not hardware.
-var wholeDisk = regexp.MustCompile(`^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme[0-9]+n[0-9]+|mmcblk[0-9]+)$`)
-
-// parseDiskStats reads /proc/diskstats; sector counts are always 512 bytes.
-func parseDiskStats(s string) []ioCounters {
-	var out []ioCounters
-	for _, line := range strings.Split(s, "\n") {
-		f := strings.Fields(line)
-		if len(f) < 10 || !wholeDisk.MatchString(f[2]) || len(out) >= maxDiskDevices {
-			continue
-		}
-		rd, err1 := strconv.ParseUint(f[5], 10, 64)
-		wr, err2 := strconv.ParseUint(f[9], 10, 64)
-		if err1 != nil || err2 != nil {
-			continue
-		}
-		out = append(out, ioCounters{f[2], rd * 512, wr * 512})
-	}
-	return out
-}
 
 // parseStatmRSS returns resident bytes from /proc/self/statm (field 2, pages).
 func parseStatmRSS(s string, pageSize int) (uint64, bool) {
@@ -330,7 +178,6 @@ type hostSampler struct {
 
 	procCPU, uptime, cpuUtil, load, memUtil, fsUtil metric.Float64ObservableGauge
 	procMem, memUsage, fsUsage                      metric.Int64ObservableGauge
-	netIO, diskIO                                   metric.Int64ObservableCounter
 }
 
 func registerHostMetrics(m metric.Meter) error {
@@ -341,9 +188,6 @@ func registerHostMetrics(m metric.Meter) error {
 	}
 	bytesGauge := func(name, desc string) (metric.Int64ObservableGauge, error) {
 		return m.Int64ObservableGauge(name, metric.WithUnit("By"), metric.WithDescription(desc))
-	}
-	bytesCounter := func(name, desc string) (metric.Int64ObservableCounter, error) {
-		return m.Int64ObservableCounter(name, metric.WithUnit("By"), metric.WithDescription(desc))
 	}
 
 	var errs []error
@@ -366,15 +210,11 @@ func registerHostMetrics(m metric.Meter) error {
 		keep(e)
 		s.memUtil, e = gauge("system.memory.utilization", "1", "Share of memory by state")
 		keep(e)
-		s.fsUsage, e = bytesGauge("system.filesystem.usage", "Filesystem space by state")
+		s.fsUsage, e = bytesGauge("system.filesystem.usage", "Root filesystem space by state")
 		keep(e)
-		s.fsUtil, e = gauge("system.filesystem.utilization", "1", "Share of filesystem space by state")
+		s.fsUtil, e = gauge("system.filesystem.utilization", "1", "Share of root filesystem space by state")
 		keep(e)
-		s.netIO, e = bytesCounter("system.network.io", "Bytes through network interfaces")
-		keep(e)
-		s.diskIO, e = bytesCounter("system.disk.io", "Bytes read from and written to disks")
-		keep(e)
-		instruments = append(instruments, s.cpuUtil, s.load, s.memUsage, s.memUtil, s.fsUsage, s.fsUtil, s.netIO, s.diskIO)
+		instruments = append(instruments, s.cpuUtil, s.load, s.memUsage, s.memUtil, s.fsUsage, s.fsUtil)
 	}
 	if err := errors.Join(errs...); err != nil {
 		return err
@@ -435,34 +275,18 @@ func (s *hostSampler) observeHost(o metric.Observer) {
 		o.ObserveFloat64(s.memUtil, float64(used)/float64(mi.total), st("used"))
 		o.ObserveFloat64(s.memUtil, float64(mi.total-used)/float64(mi.total), st("free"))
 	}
-	for _, mt := range parseMounts(readProc("/proc/mounts")) {
-		u, ok := statFS(mt.mountpoint)
-		if !ok || u.total == 0 {
-			continue
+	// The root filesystem only. Inside a container "/" is an overlay whose space is the
+	// server's own disk, so this is the server's disk either way; other mounts are only the
+	// ones the container was given (bind-mounted files such as /sbin/docker-init among them).
+	if u, ok := statFS("/"); ok && u.used+u.free > 0 {
+		st := func(state string) metric.MeasurementOption {
+			return metric.WithAttributes(attribute.String("mountpoint", "/"), attribute.String("state", state))
 		}
-		attr := func(state string) metric.MeasurementOption {
-			// An overlay root has no device; the attribute is left off, as the Node SDK does.
-			if mt.device == "" {
-				return metric.WithAttributes(attribute.String("mountpoint", mt.mountpoint), attribute.String("state", state))
-			}
-			return metric.WithAttributes(attribute.String("mountpoint", mt.mountpoint),
-				attribute.String("device", mt.device), attribute.String("state", state))
-		}
-		o.ObserveInt64(s.fsUsage, int64(u.used), attr("used"))
-		o.ObserveInt64(s.fsUsage, int64(u.free), attr("free"))
-		if denom := float64(u.used + u.free); denom > 0 {
-			o.ObserveFloat64(s.fsUtil, float64(u.used)/denom, attr("used"))
-			o.ObserveFloat64(s.fsUtil, float64(u.free)/denom, attr("free"))
-		}
-	}
-	observeIO(o, s.netIO, parseNetDev(readProc("/proc/net/dev")), "receive", "transmit")
-	observeIO(o, s.diskIO, parseDiskStats(readProc("/proc/diskstats")), "read", "write")
-}
-
-func observeIO(o metric.Observer, inst metric.Int64ObservableCounter, devs []ioCounters, dirA, dirB string) {
-	for _, d := range devs {
-		o.ObserveInt64(inst, int64(d.a), metric.WithAttributes(attribute.String("device", d.device), attribute.String("direction", dirA)))
-		o.ObserveInt64(inst, int64(d.b), metric.WithAttributes(attribute.String("device", d.device), attribute.String("direction", dirB)))
+		o.ObserveInt64(s.fsUsage, int64(u.used), st("used"))
+		o.ObserveInt64(s.fsUsage, int64(u.free), st("free"))
+		denom := float64(u.used + u.free)
+		o.ObserveFloat64(s.fsUtil, float64(u.used)/denom, st("used"))
+		o.ObserveFloat64(s.fsUtil, float64(u.free)/denom, st("free"))
 	}
 }
 

@@ -3,7 +3,6 @@ package observe
 import (
 	"context"
 	"math"
-	"reflect"
 	"runtime"
 	"testing"
 	"time"
@@ -96,78 +95,6 @@ func TestParseMemInfo(t *testing.T) {
 	}
 }
 
-func TestParseMounts(t *testing.T) {
-	in := `overlay / overlay rw,relatime 0 0
-proc /proc proc rw 0 0
-tmpfs /dev tmpfs rw 0 0
-/dev/vda1 /sbin/docker-init ext4 ro 0 0
-/dev/vda1 /etc/hosts ext4 rw 0 0
-/dev/vda1 /data/app ext4 rw 0 0
-/dev/vda1 /data ext4 rw 0 0
-/dev/vda1 /var/lib/docker/overlay2/x ext4 rw 0 0
-cgroup2 /sys/fs/cgroup cgroup2 rw 0 0
-/dev/loop3 /snap/core/1 squashfs ro 0 0
-/dev/sdb1 /mnt/my\040disk xfs rw 0 0
-server:/share /mnt/nfs nfs4 rw 0 0
-`
-	// A container: its root is the overlay, kept; /sbin/docker-init is a file, not a disk.
-	want := []mount{
-		{"", "/", "overlay"},
-		{"/dev/vda1", "/data", "ext4"},
-		{"/dev/sdb1", "/mnt/my disk", "xfs"},
-	}
-	if got := parseMounts(in); !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %+v", got)
-	}
-}
-
-func TestParseMountsHostRootTakesItsDevice(t *testing.T) {
-	in := "/dev/sda1 / ext4 rw 0 0\n/dev/sda1 /home ext4 rw 0 0\n/dev/sdb1 /srv ext4 rw 0 0\n"
-	want := []mount{{"/dev/sda1", "/", "ext4"}, {"/dev/sdb1", "/srv", "ext4"}}
-	if got := parseMounts(in); !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %+v", got)
-	}
-}
-
-func TestParseMountsCapsAtEight(t *testing.T) {
-	in := ""
-	for i := 0; i < 12; i++ {
-		in += "/dev/sd" + string(rune('a'+i)) + "1 /mnt/d" + string(rune('a'+i)) + " ext4 rw 0 0\n"
-	}
-	if got := parseMounts(in); len(got) != maxFilesystems {
-		t.Fatalf("got %d mounts", len(got))
-	}
-}
-
-func TestParseNetDev(t *testing.T) {
-	in := `Inter-|   Receive                                                |  Transmit
- face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
-    lo: 1000 10 0 0 0 0 0 0 1000 10 0 0 0 0 0 0
-  eth0: 5000 50 0 0 0 0 0 0 7000 70 0 0 0 0 0 0
-veth1a: 1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0
-docker0: 1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0
-`
-	want := []ioCounters{{"eth0", 5000, 7000}}
-	if got := parseNetDev(in); !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %+v", got)
-	}
-}
-
-func TestParseDiskStats(t *testing.T) {
-	in := `   7       0 loop0 10 0 100 5 0 0 0 0 0 0 0
-   8       0 sda 100 0 2000 50 200 0 4000 80 0 0 0
-   8       1 sda1 90 0 1800 40 190 0 3800 70 0 0 0
- 259       0 nvme0n1 5 0 16 1 6 0 32 1 0 0 0
- 259       1 nvme0n1p1 5 0 16 1 6 0 32 1 0 0 0
- 252       0 dm-0 5 0 16 1 6 0 32 1 0 0 0
-   1       0 ram0 0 0 0 0 0 0 0 0 0 0 0
-`
-	want := []ioCounters{{"sda", 2000 * 512, 4000 * 512}, {"nvme0n1", 16 * 512, 32 * 512}}
-	if got := parseDiskStats(in); !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %+v", got)
-	}
-}
-
 func TestParseStatmRSS(t *testing.T) {
 	got, ok := parseStatmRSS("5000 1200 300 10 0 800 0\n", 4096)
 	if !ok || got != 1200*4096 {
@@ -248,7 +175,24 @@ func TestRegisterHostMetricsReports(t *testing.T) {
 	want := []string{"process.cpu.utilization", "process.memory.usage", "process.uptime"}
 	if runtime.GOOS == "linux" {
 		want = append(want, "system.memory.usage", "system.memory.utilization", "system.cpu.load_average.1m",
-			"system.network.io", "system.filesystem.usage", "system.filesystem.utilization")
+			"system.filesystem.usage", "system.filesystem.utilization")
+	}
+	// From a container these described the container, not the server.
+	for _, gone := range []string{"system.network.io", "system.disk.io"} {
+		if seen[gone] {
+			t.Errorf("%s should not be reported", gone)
+		}
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if g, ok := m.Data.(metricdata.Gauge[float64]); ok && m.Name == "system.filesystem.utilization" {
+				for _, dp := range g.DataPoints {
+					if v, _ := dp.Attributes.Value("mountpoint"); v.AsString() != "/" {
+						t.Errorf("filesystem reported for %q, want only /", v.AsString())
+					}
+				}
+			}
+		}
 	}
 	for _, name := range want {
 		if !seen[name] {
