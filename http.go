@@ -3,6 +3,7 @@ package observe
 import (
 	"bufio"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -187,6 +188,18 @@ func (s *statusRecorder) Flush() {
 		}
 		f.Flush()
 	}
+}
+
+// ReadFrom keeps the writer's own ReadFrom — sendfile(2) for http.ServeFile and
+// io.Copy from a file — which wrapping it would otherwise hide.
+func (s *statusRecorder) ReadFrom(r io.Reader) (int64, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+	}
+	if rf, ok := s.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(struct{ io.Writer }{s.ResponseWriter}, r)
 }
 
 func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {

@@ -95,7 +95,28 @@ ordersProcessed, _ := observe.Meter().Int64Counter("orders.processed")
 ordersProcessed.Add(ctx, 1, metric.WithAttributes(attribute.String("status", "success")))
 ```
 
-The Go runtime is reported on its own: `process.memory.usage`, `process.runtime.go.mem.heap_alloc`, `process.runtime.go.goroutines`, `process.runtime.go.gc.count`, `process.runtime.go.gc.pause_total`.
+The Go runtime is reported on its own: `process.runtime.go.mem.heap_alloc`, `process.runtime.go.goroutines`, `process.runtime.go.gc.count`, `process.runtime.go.gc.pause_total`.
+
+### Process and host metrics
+
+Also on by default, read once per export interval, standard library only:
+
+| Metric | Unit | Attributes |
+| --- | --- | --- |
+| `process.cpu.utilization` | `1` | share of all cores, 0 to 1 |
+| `process.memory.usage` | `By` | resident memory (Go runtime bytes where `/proc` is missing) |
+| `process.uptime` | `s` | |
+| `system.cpu.utilization` | `1` | `state`: user, system, idle, nice, interrupt, softirq, steal, wait |
+| `system.cpu.load_average.1m` | `{thread}` | |
+| `system.memory.usage` | `By` | `state`: used, free, cached |
+| `system.memory.utilization` | `1` | `state`: used, free |
+| `system.filesystem.usage` / `.utilization` | `By` / `1` | `mountpoint`, `device`, `state`: used, free (real disks only, at most 8) |
+| `system.network.io` | `By` | `device`, `direction`: receive, transmit (not `lo` or container bridges) |
+| `system.disk.io` | `By` | `device`, `direction`: read, write (whole disks only) |
+
+The `system.*` metrics are read from `/proc` and `statfs`, so they are reported on Linux only; other platforms send the `process.*` ones. The resource also gets `host.name`, `host.arch`, `os.type`, `process.pid` and `service.instance.id` (values from `OTEL_RESOURCE_ATTRIBUTES` win).
+
+Turn it off with `Options.HostMetrics` or `SEENTICS_HOST_METRICS=false` (`OBSERVE_HOST_METRICS` works too). Do not run it on a host where the OpenTelemetry Collector's `hostmetrics` receiver is also enabled: the series would be sent twice.
 
 ## Delivery
 
@@ -118,6 +139,7 @@ Spans and metrics use the OTLP exporters' own retry.
 | `SEENTICS_ENVIRONMENT` | `Options.Environment` |
 | `SEENTICS_CONSOLE` | `Options.Console` |
 | `SEENTICS_TRACES_SAMPLE_RATE` | `Options.TracesSampleRate` |
+| `SEENTICS_HOST_METRICS` (or `OBSERVE_HOST_METRICS`) | `Options.HostMetrics` |
 
 With the key in the environment, traces and metrics start at import, so `Configure` is optional.
 
@@ -139,6 +161,7 @@ With the key in the environment, traces and metrics start at import, so `Configu
 | `TracesSampleRate` | `1` | share of new traces kept; continued traces keep the caller's decision |
 | `MetricExportInterval` | `60s` | |
 | `RuntimeMetrics` | `true` | Go runtime memory, goroutines, GC |
+| `HostMetrics` | `true` | process and host CPU, memory, disk, network; host figures on Linux only |
 | `OnError` | writes to stderr | the only place SDK failures surface |
 
 ## A missing key never breaks your app

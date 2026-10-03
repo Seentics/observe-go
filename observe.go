@@ -88,6 +88,13 @@ type Options struct {
 	// Default true.
 	RuntimeMetrics *bool
 
+	// HostMetrics reports process and host CPU, memory, disk and network
+	// (host figures on Linux only), plus host.* and os.type resource
+	// attributes. Default true. Env: SEENTICS_HOST_METRICS (also
+	// OBSERVE_HOST_METRICS). Turn it off if the OpenTelemetry Collector's
+	// hostmetrics receiver already covers the host — both would send it.
+	HostMetrics *bool
+
 	// OnError is called when something goes wrong inside the SDK — a failed
 	// send, dropped lines. Nothing here panics or blocks, so this is the only
 	// way to notice. Defaults to writing to stderr.
@@ -124,6 +131,7 @@ type resolved struct {
 	sampleRate           float64
 	metricExportInterval time.Duration
 	runtimeMetrics       bool
+	hostMetrics          bool
 	onError              func(error)
 }
 
@@ -162,6 +170,12 @@ func resolve(o Options) resolved {
 		r.console, _ = strconv.ParseBool(os.Getenv("SEENTICS_CONSOLE"))
 	default:
 		r.console = r.ingestKey == ""
+	}
+	r.hostMetrics = o.HostMetrics == nil || *o.HostMetrics
+	if o.HostMetrics == nil {
+		if v, err := strconv.ParseBool(firstNonEmpty(os.Getenv("SEENTICS_HOST_METRICS"), os.Getenv("OBSERVE_HOST_METRICS"))); err == nil {
+			r.hostMetrics = v
+		}
 	}
 	r.sampleRate = 1
 	if o.TracesSampleRate != nil {

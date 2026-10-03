@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
@@ -151,13 +153,15 @@ type logCore struct {
 	queue      []map[string]any
 	client     *http.Client
 
-	sending      sync.Mutex // one send at a time, so lines leave in order
+	sending      sync.Mutex  // one send at a time, so lines leave in order
+	scheduled    atomic.Bool // a background flush has been started and not yet begun
 	backoffUntil time.Time
 	failures     int
 	dropped      int
 	noKeyNoted   bool
 
 	timerOnce sync.Once
+	stopOnce  sync.Once
 	stop      chan struct{}
 	console   io.Writer
 }
@@ -175,13 +179,17 @@ func (c *logCore) configure(cfg resolved) {
 	c.startTimer()
 }
 
-func (c *logCore) ensureConfigured() {
+// settings returns the current configuration, resolving it from the
+// environment on first use.
+func (c *logCore) settings() (resolved, map[string]struct{}) {
 	c.mu.Lock()
-	done := c.configured
+	done, cfg, redact := c.configured, c.cfg, c.redact
 	c.mu.Unlock()
-	if !done {
-		c.configure(resolve(Options{}))
+	if done {
+		return cfg, redact
 	}
+	c.configure(resolve(Options{}))
+	return c.settings()
 }
 
 func (c *logCore) startTimer() {
@@ -210,19 +218,27 @@ func (c *logCore) enqueue(severity Severity, message string, fields Fields) {
 
 // enqueueFrom with console false never prints: a line from SlogHandler has
 // already been written by the handler it wraps.
+//
+// The record is built, redacted and printed outside the lock, which is held
+// only to queue it: building it under the lock serialised every goroutine
+// that logs, and eight cores logged at under twice the rate of one.
 func (c *logCore) enqueueFrom(severity Severity, message string, fields Fields, console bool) {
-	c.ensureConfigured()
+	cfg, redact := c.settings()
 
-	c.mu.Lock()
-	cfg := c.cfg
-	record := map[string]any{}
-	for k, v := range cfg.defaultFields {
-		record[k] = v
+	record := make(map[string]any, len(cfg.defaultFields)+len(fields)+6)
+	for _, source := range [2]Fields{cfg.defaultFields, fields} {
+		for k, v := range source {
+			// Redacted as it is copied — one map per line, not a copy and then a
+			// redacted copy of the copy.
+			if _, hit := redact[strings.ToLower(k)]; hit {
+				record[k] = redacted
+			} else if len(redact) > 0 {
+				record[k] = redactValue(v, redact)
+			} else {
+				record[k] = v
+			}
+		}
 	}
-	for k, v := range fields {
-		record[k] = v
-	}
-	record = redactFields(record, c.redact)
 	record["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
 	record["severity"] = string(severity)
 	record["message"] = message
@@ -235,12 +251,14 @@ func (c *logCore) enqueueFrom(severity Severity, message string, fields Fields, 
 
 	if cfg.console && console {
 		if line, err := json.Marshal(record); err == nil {
-			fmt.Fprintln(c.console, string(line))
+			line = append(line, '\n')
+			_, _ = c.console.Write(line)
 		}
 	}
 	if cfg.ingestKey == "" {
 		// Without a key the line is printed (Console) and nothing is sent. Said
 		// once, not per line — a service without observability is not an error.
+		c.mu.Lock()
 		noted := c.noKeyNoted
 		c.noKeyNoted = true
 		c.mu.Unlock()
@@ -250,6 +268,7 @@ func (c *logCore) enqueueFrom(severity Severity, message string, fields Fields, 
 		return
 	}
 
+	c.mu.Lock()
 	c.queue = append(c.queue, record)
 	if over := len(c.queue) - cfg.maxQueueSize; over > 0 {
 		c.queue = c.queue[over:]
@@ -258,14 +277,25 @@ func (c *logCore) enqueueFrom(severity Severity, message string, fields Fields, 
 	sendNow := len(c.queue) >= cfg.maxBatchSize && time.Now().After(c.backoffUntil)
 	c.mu.Unlock()
 
-	if sendNow {
-		go func() { _ = c.flush(false) }()
+	// One background flush at a time. Without the flag every line written while a
+	// full batch waited started a goroutine of its own, to queue for the send lock
+	// behind the others: thousands of parked goroutines under load, and most of
+	// the CPU spent by the GC scanning their stacks.
+	if sendNow && c.scheduled.CompareAndSwap(false, true) {
+		go func() {
+			c.sending.Lock()
+			c.scheduled.Store(false)
+			c.sending.Unlock()
+			_ = c.flush(false)
+		}()
 	}
 }
 
 // flush sends the queue in batches, oldest first, one request at a time. A
-// batch that fails for a passing reason stays queued and the queue waits out
-// a backoff (Retry-After when the server gives one); one the server will never
+// batch is taken off the queue while it is sent, so lines written meanwhile
+// can only push out other queued lines, never the ones in flight. One that
+// fails for a passing reason goes back to the front and the queue waits out a
+// backoff (Retry-After when the server gives one); one the server will never
 // accept is dropped and reported. force ignores the backoff.
 func (c *logCore) flush(force bool) error {
 	c.sending.Lock()
@@ -280,11 +310,9 @@ func (c *logCore) flush(force bool) error {
 			c.mu.Unlock()
 			return lastErr
 		}
-		n := len(c.queue)
-		if n > cfg.maxBatchSize {
-			n = cfg.maxBatchSize
-		}
-		batch := append([]map[string]any(nil), c.queue[:n]...)
+		n := min(len(c.queue), cfg.maxBatchSize)
+		batch := c.queue[:n:n]
+		c.queue = c.queue[n:]
 		c.mu.Unlock()
 
 		retryable, retryAfter, err := c.send(cfg.endpoint, cfg.ingestKey, batch)
@@ -292,17 +320,22 @@ func (c *logCore) flush(force bool) error {
 		c.mu.Lock()
 		switch {
 		case err == nil:
-			c.queue = c.queue[min(n, len(c.queue)):]
 			c.failures = 0
 			c.backoffUntil = time.Time{}
 		case !retryable:
 			// Will fail the same way every time — a revoked key, a plan limit.
-			c.queue = c.queue[min(n, len(c.queue)):]
 			c.mu.Unlock()
 			cfg.onError(fmt.Errorf("dropped %d log lines: %w", n, err))
 			lastErr = err
 			continue
 		default:
+			// Back at the front, so lines still leave in the order they were written;
+			// past the bound the oldest go, as they would have had they waited here.
+			c.queue = append(batch, c.queue...)
+			if over := len(c.queue) - cfg.maxQueueSize; over > 0 {
+				c.queue = c.queue[over:]
+				c.dropped += over
+			}
 			c.failures++
 			delay := retryAfter
 			if delay <= 0 {
@@ -373,11 +406,9 @@ func (c *logCore) send(endpoint, ingestKey string, records []map[string]any) (re
 // close stops the timer and sends what is queued, waiting at most until ctx
 // is done.
 func (c *logCore) close(ctx context.Context) error {
-	select {
-	case <-c.stop:
-	default:
-		close(c.stop)
-	}
+	// Once: two Shutdowns at the same moment both saw the channel open and the
+	// second close panicked.
+	c.stopOnce.Do(func() { close(c.stop) })
 	done := make(chan error, 1)
 	go func() { done <- c.flush(true) }()
 	select {

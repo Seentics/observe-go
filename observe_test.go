@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -287,4 +288,87 @@ func TestSlogHandlerForwardsAttrsAndGroups(t *testing.T) {
 
 func otelTraceID(ctx context.Context) string {
 	return trace.SpanContextFromContext(ctx).TraceID().String()
+}
+
+// A batch in flight is not in the queue: lines written while it is being sent
+// must not push it out, and its success must not take unsent lines with it.
+// It used to: the overflow dropped the in-flight lines from the front, and the
+// success then removed as many again — lines that had never been sent.
+func TestOverflowWhileSendingLosesNoUnsentLine(t *testing.T) {
+	in := &ingest{}
+	release := make(chan struct{})
+	var first atomic.Bool
+	var arrived atomic.Int32
+	gate := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrived.Add(1)
+		if first.CompareAndSwap(false, true) {
+			<-release
+		}
+		in.ServeHTTP(w, r)
+	})
+	srv := httptest.NewServer(gate)
+	t.Cleanup(srv.Close)
+	l := &Logger{core: newCore()}
+	l.core.configure(resolve(Options{IngestKey: "k", Endpoint: srv.URL, FlushInterval: time.Hour, MaxQueueSize: 4, MaxBatchSize: 2, OnError: func(error) {}}))
+	t.Cleanup(func() { _ = l.core.close(context.Background()) })
+
+	for _, m := range []string{"a", "b", "c", "d"} {
+		l.Info(m, nil)
+	}
+	done := make(chan error, 1)
+	go func() { done <- l.Flush() }()
+	for arrived.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	l.Info("e", nil) // a and b are in flight; c, d, e, f fit the queue
+	l.Info("f", nil)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, line := range in.accepted() {
+		got = append(got, line["message"].(string))
+	}
+	if strings.Join(got, "") != "abcdef" {
+		t.Fatalf("delivered %v, want every line once, in order", got)
+	}
+}
+
+func TestConcurrentShutdownDoesNotPanic(t *testing.T) {
+	in := &ingest{}
+	l, _ := testLogger(t, in, Options{})
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = l.core.close(context.Background()) }()
+	}
+	wg.Wait()
+}
+
+// A file served through the middleware still reaches the connection's own
+// ReadFrom (sendfile), and is recorded as a 200.
+func TestMiddlewareKeepsReadFrom(t *testing.T) {
+	var used bool
+	w := &readFromRecorder{ResponseRecorder: httptest.NewRecorder(), used: &used}
+	h := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(w, struct{ io.Reader }{strings.NewReader("hello")}) // a plain reader, as a file is
+	}))
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/file", nil))
+	if !used || w.Body.String() != "hello" || w.Code != http.StatusOK {
+		t.Fatalf("ReadFrom used=%v body=%q code=%d", used, w.Body.String(), w.Code)
+	}
+}
+
+type readFromRecorder struct {
+	*httptest.ResponseRecorder
+	used *bool
+}
+
+func (r *readFromRecorder) ReadFrom(src io.Reader) (int64, error) {
+	*r.used = true
+	return io.Copy(r.ResponseRecorder, src)
 }

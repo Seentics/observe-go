@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"sync"
 
@@ -63,7 +64,7 @@ func startTelemetry(cfg resolved) error {
 	if cfg.environment != "" {
 		attrs = append(attrs, attribute.String("deployment.environment", cfg.environment))
 	}
-	res, err := resource.New(ctx, resource.WithAttributes(attrs...), resource.WithHost(), resource.WithProcessPID())
+	res, err := resource.New(ctx, buildResourceOptions(cfg, attrs)...)
 	if err != nil {
 		return fmt.Errorf("build resource: %w", err)
 	}
@@ -115,39 +116,74 @@ func startTelemetry(cfg resolved) error {
 	telemetryStarted = true
 
 	if cfg.runtimeMetrics {
-		if err := registerRuntimeMetrics(mp.Meter(instrumentationName)); err != nil {
+		// With host metrics on, process.memory.usage is reported there as RSS.
+		if err := registerRuntimeMetrics(mp.Meter(instrumentationName), !cfg.hostMetrics); err != nil {
 			onError(fmt.Errorf("runtime metrics: %w", err))
+		}
+	}
+	if cfg.hostMetrics {
+		if err := registerHostMetrics(mp.Meter(instrumentationName)); err != nil {
+			onError(fmt.Errorf("host metrics: %w", err))
 		}
 	}
 	return nil
 }
 
+// buildResourceOptions adds host.arch, os.type and service.instance.id when
+// host metrics are on. OTEL_RESOURCE_ATTRIBUTES is read after them, so a value
+// the user already set wins; host.name and process.pid come from the detectors.
+func buildResourceOptions(cfg resolved, attrs []attribute.KeyValue) []resource.Option {
+	opts := []resource.Option{resource.WithHost(), resource.WithProcessPID()}
+	if cfg.hostMetrics {
+		host, _ := os.Hostname()
+		opts = append(opts, resource.WithAttributes(
+			attribute.String("host.arch", runtime.GOARCH),
+			attribute.String("os.type", runtime.GOOS),
+			semconv.ServiceInstanceID(fmt.Sprintf("%s-%d", host, os.Getpid())),
+		), resource.WithFromEnv())
+	}
+	return append(opts, resource.WithAttributes(attrs...))
+}
+
 // registerRuntimeMetrics reports memory, goroutines and GC, read once per
 // export — ReadMemStats stops the world for microseconds, so never per call.
-func registerRuntimeMetrics(m metric.Meter) error {
+// withProcessMemory adds process.memory.usage as bytes obtained from the OS;
+// registerHostMetrics reports it as resident memory instead.
+func registerRuntimeMetrics(m metric.Meter, withProcessMemory bool) error {
 	heap, err1 := m.Int64ObservableGauge("process.runtime.go.mem.heap_alloc", metric.WithUnit("By"),
 		metric.WithDescription("Bytes of allocated heap objects"))
-	sys, err2 := m.Int64ObservableGauge("process.memory.usage", metric.WithUnit("By"),
-		metric.WithDescription("Bytes of memory obtained from the OS"))
 	goroutines, err3 := m.Int64ObservableGauge("process.runtime.go.goroutines",
 		metric.WithDescription("Goroutines that currently exist"))
 	gcCount, err4 := m.Int64ObservableCounter("process.runtime.go.gc.count",
 		metric.WithDescription("Completed garbage collection cycles"))
 	gcPause, err5 := m.Float64ObservableCounter("process.runtime.go.gc.pause_total", metric.WithUnit("s"),
 		metric.WithDescription("Total time the world was stopped for garbage collection"))
-	if err := errors.Join(err1, err2, err3, err4, err5); err != nil {
+	if err := errors.Join(err1, err3, err4, err5); err != nil {
 		return err
+	}
+	instruments := []metric.Observable{heap, goroutines, gcCount, gcPause}
+	var sys metric.Int64ObservableGauge
+	if withProcessMemory {
+		var err error
+		sys, err = m.Int64ObservableGauge("process.memory.usage", metric.WithUnit("By"),
+			metric.WithDescription("Bytes of memory obtained from the OS"))
+		if err != nil {
+			return err
+		}
+		instruments = append(instruments, sys)
 	}
 	_, err := m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
 		o.ObserveInt64(heap, int64(ms.HeapAlloc))
-		o.ObserveInt64(sys, int64(ms.Sys))
+		if withProcessMemory {
+			o.ObserveInt64(sys, int64(ms.Sys))
+		}
 		o.ObserveInt64(goroutines, int64(runtime.NumGoroutine()))
 		o.ObserveInt64(gcCount, int64(ms.NumGC))
 		o.ObserveFloat64(gcPause, float64(ms.PauseTotalNs)/1e9)
 		return nil
-	}, heap, sys, goroutines, gcCount, gcPause)
+	}, instruments...)
 	return err
 }
 
