@@ -61,7 +61,7 @@ type Options struct {
 	// non-nil slice turns redaction off.
 	Redact []string
 
-	// MaxBatchSize is how many log lines are sent per request. Default 500.
+	// MaxBatchSize is how many log lines are sent per request. Default 2000.
 	MaxBatchSize int
 
 	// MaxQueueSize is the most log lines held while the endpoint is
@@ -144,7 +144,7 @@ func resolve(o Options) resolved {
 		environment:          firstNonEmpty(o.Environment, os.Getenv("SEENTICS_ENVIRONMENT")),
 		defaultFields:        o.DefaultFields,
 		redact:               o.Redact,
-		maxBatchSize:         positive(o.MaxBatchSize, 500),
+		maxBatchSize:         positive(o.MaxBatchSize, 2000),
 		maxQueueSize:         positive(o.MaxQueueSize, 10_000),
 		flushInterval:        o.FlushInterval,
 		metricExportInterval: o.MetricExportInterval,

@@ -152,7 +152,7 @@ With the key in the environment, traces and metrics start at import, so `Configu
 | `Environment` | `SEENTICS_ENVIRONMENT` | `deployment.environment` |
 | `DefaultFields` | `nil` | merged into every log line |
 | `Redact` | secret-looking names | an empty, non-nil slice turns redaction off |
-| `MaxBatchSize` | `500` | log lines per request (at most 5000) |
+| `MaxBatchSize` | `2000` | log lines per request (at most 5000) |
 | `MaxQueueSize` | `10000` | log lines held while sending is behind |
 | `FlushInterval` | `5s` | how often queued lines are sent |
 | `Console` | on without a key | also print every line to stderr as JSON |
